@@ -1,0 +1,13 @@
+# Private configuration used for palette-only Matugen calls.
+#
+# The command is intentionally inert because set=false. Some Matugen
+# versions still require the field to be present when this section exists.
+[config]
+caching = false
+
+[config.wallpaper]
+set = false
+command = "true"
+
+# Required by Matugen's configuration schema even for palette-only calls.
+[templates]

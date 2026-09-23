@@ -1,0 +1,966 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="3.3.6"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+THEMY_CONFIG_DIR="$XDG_CONFIG_HOME/themy"
+# The executable may live in /usr/local/bin; all Themy runtime assets live in ~/.config/themy.
+ROOT_DIR="$THEMY_CONFIG_DIR"
+THEMY_DATA_DIR="$XDG_DATA_HOME/themy"
+THEMY_STATE_DIR="$XDG_STATE_HOME/themy"
+BUILTIN_MODULES_DIR="$THEMY_CONFIG_DIR/templates"
+MODULES_DIR="${THEMY_MODULES_DIR:-$THEMY_CONFIG_DIR/modules}"
+TEMPLATES_DIR="$MODULES_DIR"
+CURRENT_DIR="$THEMY_STATE_DIR/current"
+STATE_FILE="$THEMY_STATE_DIR/state.json"
+MODULE_STATE="$THEMY_CONFIG_DIR/modules.json"
+DELETED_MODULES="$THEMY_CONFIG_DIR/deleted_modules.txt"
+IGNORE_LIST="$THEMY_CONFIG_DIR/ignore_modules.txt"
+BACKUP_DIR="$THEMY_STATE_DIR/backup"
+PREVIEW_CACHE="$XDG_CACHE_HOME/themy/previews"
+
+MODE=""
+SCHEME=""
+COLOR=""
+WALLPAPER=""
+WALLPAPER_DIR=""
+CONTRAST=""
+COMMAND="gui"
+MODULE_SUB=""
+MODULE_NAME=""
+MODULE_ACTION=""
+MODULE_URL=""
+NONINTERACTIVE=0
+QUIET=0
+NO_APPLY=0
+RENDER_FAILED_MODULES=()
+STAGE_CLEANUP=""
+
+SCHEMES=(
+  scheme-tonal-spot scheme-expressive scheme-fidelity scheme-fruit-salad
+  scheme-monochrome scheme-neutral scheme-rainbow scheme-content
+)
+
+log(){ (( QUIET )) || printf '%s\n' "$*"; }
+warn(){ printf 'Warning: %s\n' "$*" >&2; }
+fatal(){ printf 'Error: %s\n' "$*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || fatal "required command not found: $1"; }
+
+valid_module_name(){
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || fatal "invalid module name: $1"
+}
+
+validate_module_tree(){
+  local dir="$1" path
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  while IFS= read -r -d "" path; do
+    [[ ! -L "$path" ]] || return 1
+  done < <(find "$dir" -print0)
+  [[ -f "$dir/module.conf" && -f "$dir/render" && -f "$dir/apply" ]] || return 1
+}
+
+validate_wallpaper(){
+  local p="$1"
+  [[ "$p" == /* ]] || fatal "wallpaper must be an absolute path: $p"
+  [[ -f "$p" && ! -L "$p" && -r "$p" ]] || fatal "wallpaper is not a readable regular file: $p"
+}
+
+validate_external_path(){
+  local name="$1" value="$2"
+  [[ "$value" == /* ]] || fatal "$name must be an absolute path: $value"
+}
+
+ensure_layout(){
+  validate_external_path XDG_CONFIG_HOME "$XDG_CONFIG_HOME"
+  validate_external_path XDG_DATA_HOME "$XDG_DATA_HOME"
+  validate_external_path XDG_STATE_HOME "$XDG_STATE_HOME"
+  if [[ -n "${THEMY_MODULES_DIR:-}" ]]; then
+    validate_external_path THEMY_MODULES_DIR "$THEMY_MODULES_DIR"
+  fi
+  if [[ -n "${YAZI_CONFIG_HOME:-}" ]]; then
+    validate_external_path YAZI_CONFIG_HOME "$YAZI_CONFIG_HOME"
+  fi
+
+  umask 077
+  mkdir -p -- "$THEMY_CONFIG_DIR" "$MODULES_DIR" "$THEMY_DATA_DIR" "$THEMY_STATE_DIR" "$CURRENT_DIR"
+}
+
+usage(){
+  cat <<USAGE
+Themy $VERSION
+
+Usage:
+  themy                       Open the GUI
+  themy -i                    Interactive CLI
+  themy [options] IMAGE       Apply a theme from IMAGE
+  themy current-wallpaper     Print the current wallpaper path
+  themy status
+  themy doctor
+  themy modules
+  themy module list
+  themy module install GIT-URL [NAME]
+  themy module delete NAME
+  themy module NAME on|off
+  themy restore-backup
+  themy paths
+  themy gui
+
+Options:
+  -i, --interactive          Interactive CLI; choose wallpaper/options interactively
+  --dark                  Dark mode
+  --light                 Light mode
+  --scheme NAME           Matugen scheme
+  --color VALUE           auto | 1..N | #RRGGBB
+  --contrast VALUE        Matugen contrast (-1..1)
+  --non-interactive       Require all generation choices on the command line
+  --no-apply              Generate and validate only
+  --quiet                 Reduce output
+  -h, --help              Show help
+  --version               Show version
+
+Config directory:
+  $HOME/.config/themy/
+
+Path diagnostics:
+  themy paths
+
+Module directory:
+  $HOME/.config/themy/modules/<name>/
+
+Module contract:
+  modules/<name>/module.conf
+  modules/<name>/render
+  modules/<name>/apply
+  modules/<name>/backup       (optional, for rollback)
+  modules/<name>/restore      (optional, for rollback)
+  modules/<name>/doctor       (optional)
+USAGE
+}
+
+scheme_label(){
+  case "$1" in
+    scheme-tonal-spot) printf 'Tonal Spot';; scheme-expressive) printf 'Expressive';;
+    scheme-fidelity) printf 'Fidelity';; scheme-fruit-salad) printf 'Fruit Salad';;
+    scheme-monochrome) printf 'Monochrome';; scheme-neutral) printf 'Neutral';;
+    scheme-rainbow) printf 'Rainbow';; scheme-content) printf 'Content';;
+    *) printf '%s' "$1";;
+  esac
+}
+
+normalize_scheme(){ [[ "$1" == scheme-* ]] && printf '%s\n' "$1" || printf 'scheme-%s\n' "$1"; }
+valid_scheme(){ local s="$1" x; for x in "${SCHEMES[@]}"; do [[ "$x" == "$s" ]] && return 0; done; return 1; }
+valid_hex(){ [[ "$1" =~ ^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$ ]]; }
+
+read_state(){
+  [[ -f "$STATE_FILE" ]] || return 1
+  python3 - "$STATE_FILE" "$1" <<'PY'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1],encoding='utf-8'))
+    v=d.get(sys.argv[2])
+    if v is not None: print(v)
+except Exception: pass
+PY
+}
+
+save_state(){
+  mkdir -p "$THEMY_STATE_DIR" "$CURRENT_DIR"
+  python3 - "$STATE_FILE" "$WALLPAPER" "$MODE" "$SCHEME" "$COLOR" <<'PY'
+import json,os,sys,tempfile
+p,wall,mode,scheme,color=sys.argv[1:]
+d={}
+if os.path.exists(p):
+    try: d=json.load(open(p,encoding='utf-8'))
+    except Exception: pass
+d.update(wallpaper=wall,mode=mode,scheme=scheme,color=color,palette=os.path.join(os.path.dirname(p),'current','palette.json'))
+os.makedirs(os.path.dirname(p),exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix='.state.',dir=os.path.dirname(p),text=True)
+with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(d,f,indent=2); f.write('\n')
+os.chmod(tmp,0o600)
+os.replace(tmp,p)
+PY
+}
+
+module_deleted(){
+  [[ -f "$DELETED_MODULES" ]] && grep -qx -- "$1" "$DELETED_MODULES"
+}
+
+bootstrap_modules(){
+  mkdir -p "$MODULES_DIR"
+  [[ "$MODULES_DIR" != "$BUILTIN_MODULES_DIR" ]] || return 0
+
+  local src name dst
+  for src in "$BUILTIN_MODULES_DIR"/*; do
+    [[ -d "$src" && -f "$src/module.conf" ]] || continue
+    name="$(basename "$src")"
+    dst="$MODULES_DIR/$name"
+    [[ -e "$dst" ]] && continue
+    module_deleted "$name" && continue
+    cp -a -- "$src" "$dst"
+  done
+}
+
+load_module_state(){
+  bootstrap_modules
+  mkdir -p "$(dirname "$MODULE_STATE")"
+  [[ -f "$MODULE_STATE" ]] && return
+  python3 - "$MODULE_STATE" "$TEMPLATES_DIR" <<'PY'
+import json,glob,os,sys
+p,root=sys.argv[1:]
+d={}
+for f in glob.glob(os.path.join(root,'*','module.conf')):
+    name=os.path.basename(os.path.dirname(f))
+    d[name]=True
+os.makedirs(os.path.dirname(p),exist_ok=True)
+with open(p,'w',encoding='utf-8') as h: json.dump(d,h,indent=2); h.write('\n')
+PY
+}
+
+module_enabled(){
+  load_module_state
+  python3 - "$MODULE_STATE" "$1" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1],encoding='utf-8'))
+except Exception: d={}
+print('1' if d.get(sys.argv[2],True) else '0')
+PY
+}
+
+set_module_state(){
+  load_module_state
+  python3 - "$MODULE_STATE" "$1" "$2" <<'PY'
+import json,os,sys,tempfile
+a,n,v=sys.argv[1:]
+try: d=json.load(open(a,encoding='utf-8'))
+except Exception: d={}
+d[n]=v=='on'
+fd,t=tempfile.mkstemp(prefix='.modules.',dir=os.path.dirname(a),text=True)
+with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(d,f,indent=2); f.write('\n')
+os.replace(t,a)
+PY
+}
+
+module_value(){
+  local file="$1" key="$2"
+  awk -F= -v k="$key" '$1==k {sub(/^[[:space:]]*/,"",$2); sub(/[[:space:]]*$/,"",$2); print $2; exit}' "$file"
+}
+
+module_contract_ok(){
+  local dir="$1"
+  [[ -f "$dir/module.conf" && -x "$dir/render" && -x "$dir/apply" ]]
+}
+
+modules(){
+  local dir name conf enabled desc tag
+  load_module_state
+  printf 'Themy modules (%s)\n\n' "$MODULES_DIR"
+  for dir in "$TEMPLATES_DIR"/*; do
+    [[ -d "$dir" ]] || continue
+    conf="$dir/module.conf"; [[ -f "$conf" ]] || continue
+    name="$(basename "$dir")"
+    enabled="$(module_enabled "$name")"
+    desc="$(module_value "$conf" description)"
+    tag=""
+    module_contract_ok "$dir" || tag='  [incomplete]'
+    printf '  %-14s %-9s %s%s\n' "$name" \
+      "$([[ "$enabled" == 1 ]] && printf enabled || printf disabled)" "$desc" "$tag"
+  done
+}
+
+discover_modules(){
+  load_module_state
+  python3 - "$MODULE_STATE" "$TEMPLATES_DIR" <<'PY_DISCOVER'
+import json, os, sys
+state_path, root = sys.argv[1:]
+try:
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+except Exception:
+    state = {}
+for name in sorted(os.listdir(root)):
+    path = os.path.join(root, name)
+    if not os.path.isdir(path):
+        continue
+    if not os.path.isfile(os.path.join(path, "module.conf")):
+        continue
+    if not os.access(os.path.join(path, "render"), os.X_OK):
+        continue
+    if not os.access(os.path.join(path, "apply"), os.X_OK):
+        continue
+    if state.get(name, True):
+        print(name)
+PY_DISCOVER
+}
+
+trim(){ local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
+
+# ---------- module install / delete ----------
+
+module_install(){
+  local url="$1" want="${2:-}"
+  need git
+  [[ -n "$url" ]] || fatal 'usage: themy module install GIT-URL [NAME]'
+
+  local cache="$THEMY_STATE_DIR/repo-catalog"
+  rm -rf -- "$cache"
+  mkdir -p -- "$cache"
+  log "Fetching module repository: $url"
+  if ! git clone --depth 1 -- "$url" "$cache/repo" >/dev/null 2>&1; then
+    rm -rf -- "$cache"
+    fatal "could not clone: $url"
+  fi
+
+  local -a ignore=(".git" ".github" "docs")
+  if [[ -f "$IGNORE_LIST" ]]; then
+    local line
+    while IFS= read -r line; do
+      line="${line%%#*}"; line="$(trim "$line")"
+      [[ -n "$line" ]] && ignore+=("$line")
+    done < "$IGNORE_LIST"
+  fi
+
+  local -a candidates=()
+  local d name skip i
+  if [[ -f "$cache/repo/module.conf" ]]; then
+    candidates+=("$cache/repo")
+  else
+    for d in "$cache/repo"/*/; do
+      [[ -d "$d" && -f "$d/module.conf" ]] || continue
+      candidates+=("$d")
+    done
+  fi
+  ((${#candidates[@]})) || { rm -rf -- "$cache"; fatal 'no module directories (with module.conf) found in repository'; }
+
+  local installed=0 installed_names="" failures=0
+  for d in "${candidates[@]}"; do
+    name="$(basename "$d")"
+    valid_module_name "$name"
+    skip=0
+    for i in "${ignore[@]}"; do [[ "$name" == "$i" ]] && { skip=1; break; }; done
+    ((skip)) && continue
+    [[ -z "$want" || "$name" == "$want" ]] || continue
+
+    if [[ -e "$MODULES_DIR/$name" ]]; then
+      log "  updating $name"
+      rm -rf -- "$MODULES_DIR/$name"
+    else
+      log "  installing $name"
+    fi
+    if ! validate_module_tree "$d"; then
+      warn "module "$name" contains unsafe links or is incomplete; refusing to install"
+      rm -rf -- "$MODULES_DIR/$name"
+      failures=$((failures+1))
+      continue
+    fi
+    cp -a -- "$d" "$MODULES_DIR/$name"
+    if ! validate_module_tree "$MODULES_DIR/$name"; then
+      warn "module "$name" failed post-copy safety validation"
+      rm -rf -- "$MODULES_DIR/$name"
+      failures=$((failures+1))
+      continue
+    fi
+    chmod -- u+x "$MODULES_DIR/$name/render" "$MODULES_DIR/$name/apply" 2>/dev/null || true
+    if ! module_contract_ok "$MODULES_DIR/$name"; then
+      warn "module '$name' is incomplete (needs module.conf, render, apply); it was not kept"
+      rm -rf -- "$MODULES_DIR/$name"
+      failures=$((failures+1))
+      continue
+    fi
+    installed=$((installed+1))
+    installed_names="$installed_names $name"
+    if [[ -f "$DELETED_MODULES" ]]; then
+      grep -vx -- "$name" "$DELETED_MODULES" > "$DELETED_MODULES.tmp" 2>/dev/null || : > "$DELETED_MODULES.tmp"
+      mv -f -- "$DELETED_MODULES.tmp" "$DELETED_MODULES"
+    fi
+  done
+  rm -rf -- "$cache"
+
+  if [[ -n "$want" && "$installed" == 0 ]]; then
+    fatal "module '$want' not found in repository (or it failed its contract check)"
+  fi
+  ((installed)) && load_module_state
+  if ((installed)); then
+    log "Installed:$installed_names"
+  else
+    warn 'nothing was installed'
+  fi
+  return "$((failures > 0))"
+}
+
+module_delete(){
+  local name="$1"
+  [[ -n "$name" ]] || fatal 'usage: themy module delete NAME'
+  valid_module_name "$name"
+  [[ -d "$MODULES_DIR/$name" && ! -L "$MODULES_DIR/$name" ]] || fatal "module not installed or unsafe: $name"
+  rm -rf -- "$MODULES_DIR/$name"
+  grep -vx -- "$name" "$DELETED_MODULES" 2>/dev/null > "$DELETED_MODULES.tmp" || : > "$DELETED_MODULES.tmp"
+  printf '%s\n' "$name" >> "$DELETED_MODULES.tmp"
+  mv -f -- "$DELETED_MODULES.tmp" "$DELETED_MODULES"
+
+  python3 - "$MODULE_STATE" "$name" <<'PY'
+import json,os,sys
+p,n=sys.argv[1:]
+if os.path.exists(p):
+    try: d=json.load(open(p,encoding='utf-8'))
+    except Exception: d={}
+    if n in d:
+        d.pop(n)
+        with open(p,'w',encoding='utf-8') as f: json.dump(d,f,indent=2); f.write('\n')
+PY
+  log "Deleted module: $name"
+}
+
+# ---------- interactive color preview ----------
+
+print_current_wallpaper(){
+  local wallpaper
+  wallpaper="$(current_wallpaper 2>/dev/null || true)"
+  [[ -n "$wallpaper" ]] || fatal 'could not determine the current wallpaper'
+  [[ -f "$wallpaper" ]] || fatal "current wallpaper does not exist: $wallpaper"
+  printf '%s\n' "$(realpath "$wallpaper")"
+}
+
+current_wallpaper(){
+  local f
+  for f in "$THEMY_STATE_DIR/wallpaper" "$THEMY_STATE_DIR/DankMaterialShell/session.json" "$XDG_CONFIG_HOME/DankMaterialShell/session.json"; do
+    [[ -f "$f" ]] || continue
+    if [[ "$f" == *.json ]]; then
+      python3 - "$f" <<'PY'
+import json,sys
+try:
+ d=json.load(open(sys.argv[1],encoding='utf-8')); v=d.get('wallpaperPath')
+ if isinstance(v,str) and v.startswith('/'): print(v)
+except Exception: pass
+PY
+    else cat "$f"; fi
+    return 0
+  done
+  return 1
+}
+
+load_wallpaper_dir(){
+  WALLPAPER_DIR="$(read_state wallpaper_folder 2>/dev/null || true)"
+}
+
+save_wallpaper_dir(){
+  local dir="$1"
+  mkdir -p -- "$THEMY_STATE_DIR"
+  python3 - "$STATE_FILE" "$dir" <<'PY'
+import json,os,sys,tempfile
+p,folder=sys.argv[1:]
+d={}
+if os.path.exists(p):
+    try: d=json.load(open(p,encoding='utf-8'))
+    except Exception: d={}
+d['wallpaper_folder']=folder
+os.makedirs(os.path.dirname(p),exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix='.state.',dir=os.path.dirname(p),text=True)
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(d,f,indent=2); f.write('\n')
+os.chmod(tmp,0o600)
+os.replace(tmp,p)
+PY
+}
+
+choose_wallpaper_folder(){
+  local p=""
+  printf 'Wallpaper folder: '
+  read -r p
+  p="$(trim "$p")"
+  [[ -n "$p" ]] || fatal 'wallpaper folder is required'
+  [[ -d "$p" ]] || fatal "wallpaper folder not found: $p"
+  WALLPAPER_DIR="$(realpath "$p")"
+  save_wallpaper_dir "$WALLPAPER_DIR"
+}
+
+choose_wallpaper(){
+  local p=""
+  load_wallpaper_dir
+  [[ -d "$WALLPAPER_DIR" ]] || choose_wallpaper_folder
+  if command -v fzf >/dev/null 2>&1; then
+    p="$(find "$WALLPAPER_DIR" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.jxl' -o -iname '*.bmp' -o -iname '*.gif' -o -iname '*.avif' \) 2>/dev/null | sort | fzf --height=40% --layout=reverse --prompt='Image > ' || true)"
+  fi
+  [[ -n "$p" ]] || { printf 'Image path: '; read -r p; }
+  [[ -f "$p" ]] || fatal "image not found: $p"
+  WALLPAPER="$(realpath "$p")"
+  WALLPAPER_DIR="$(dirname "$WALLPAPER")"
+  save_wallpaper_dir "$WALLPAPER_DIR"
+}
+
+choose_color(){
+  [[ -n "$WALLPAPER" ]] || choose_wallpaper
+  printf '\nColor  enter a wallpaper color number or h for HEX\n> '
+  local x; read -r x; x="$(trim "$x")"
+  if [[ "$x" =~ ^[1-9][0-9]*$ ]]; then COLOR="$x"
+  elif [[ "$x" =~ ^[hH]$ ]]; then printf 'HEX: '; read -r x; valid_hex "$x" || fatal 'invalid HEX color'; COLOR="$x"
+  else fatal 'invalid color choice'; fi
+}
+
+resolve_inputs(){
+  if [[ -z "$MODE" ]]; then ((NONINTERACTIVE)) && fatal 'specify --dark or --light' || choose_mode; fi
+  if [[ -z "$SCHEME" ]]; then ((NONINTERACTIVE)) && fatal 'specify --scheme' || choose_scheme; fi
+  SCHEME="$(normalize_scheme "$SCHEME")"; valid_scheme "$SCHEME" || fatal "unsupported scheme: $SCHEME"
+  if [[ -z "$COLOR" ]]; then ((NONINTERACTIVE)) && { COLOR=auto; } || choose_color; fi
+  if [[ "$COLOR" == auto || "$COLOR" =~ ^[1-9][0-9]*$ ]]; then
+    [[ -n "$WALLPAPER" ]] || { ((NONINTERACTIVE)) && fatal 'wallpaper required for auto/numeric color' || choose_wallpaper; }
+  elif valid_hex "$COLOR"; then :
+  else fatal 'color must be auto, a positive number, or #RRGGBB'; fi
+  [[ -n "$WALLPAPER" ]] && {
+    [[ -f "$WALLPAPER" ]] || fatal "image not found: $WALLPAPER"
+    WALLPAPER="$(realpath "$WALLPAPER")"
+    WALLPAPER_DIR="$(dirname "$WALLPAPER")"
+    save_wallpaper_dir "$WALLPAPER_DIR"
+  }
+  if [[ -n "$CONTRAST" ]]; then awk -v x="$CONTRAST" 'BEGIN{exit !(x>=-1 && x<=1)}' || fatal 'contrast must be between -1 and 1'; fi
+}
+
+json_color(){
+  local file="$1" key="$2" mode="$3"
+  python3 - "$file" "$key" "$mode" <<'PY'
+import json,sys
+with open(sys.argv[1],encoding='utf-8') as f: d=json.load(f)
+key,mode=sys.argv[2:]
+colors=d.get('colors',d)
+
+def leaf(v):
+    if isinstance(v,str):
+        if v.startswith('#'): return v
+    if isinstance(v,dict):
+        for k in ('hex','color','hex_stripped'):
+            x=v.get(k)
+            if isinstance(x,str): return x if x.startswith('#') else '#'+x
+    return None
+
+def emit(v):
+    x=leaf(v)
+    if x:
+        print(x); raise SystemExit(0)
+
+if isinstance(colors,dict):
+    for bucket_name in (mode,'default','dark','light'):
+        b=colors.get(bucket_name)
+        if isinstance(b,dict) and key in b: emit(b[key])
+    item=colors.get(key)
+    if isinstance(item,dict):
+        for bucket_name in (mode,'default','dark','light'): emit(item.get(bucket_name))
+        emit(item)
+    emit(item)
+raise SystemExit(1)
+PY
+}
+
+swatch(){
+  local h="$1"
+  if [[ "$h" =~ ^#[0-9A-Fa-f]{6}$ ]] && [[ -t 1 ]]; then
+    printf '\033[48;2;%d;%d;%dm  \033[0m %s' \
+      $((16#${h:1:2})) $((16#${h:3:2})) $((16#${h:5:2})) "$h"
+  else
+    printf '%s' "$h"
+  fi
+}
+
+preview_one(){
+  local scheme="$1" out="$2" cfg
+  cfg="$(mktemp "$PREVIEW_DIR/.matugen-config.XXXXXX.toml")"
+  cp -- "$THEMY_CONFIG_DIR/internals/matugen-config.toml" "$cfg"
+  local -a args=(image "$WALLPAPER" -m "$MODE" -t "$scheme" --json hex --dry-run)
+  if ! matugen -c "$cfg" "${args[@]}" > "$out" 2> "$out.err"; then
+    rm -f -- "$cfg" "$out"
+    return 1
+  fi
+  rm -f -- "$cfg"
+  return 0
+}
+
+build_previews(){
+  local hash dir scheme out
+  hash="$(sha256sum "$WALLPAPER" | cut -d' ' -f1)"
+  dir="$PREVIEW_CACHE/$hash/$MODE"
+  mkdir -p "$dir"
+  PREVIEW_DIR="$dir"
+  AVAILABLE_SCHEMES=()
+  for scheme in "${SCHEMES[@]}"; do
+    out="$dir/$scheme.json"
+    if [[ -s "$out" ]] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$out" >/dev/null 2>&1; then
+      AVAILABLE_SCHEMES+=("$scheme")
+      continue
+    fi
+    if preview_one "$scheme" "$out"; then
+      AVAILABLE_SCHEMES+=("$scheme")
+    else
+      rm -f -- "$out" "$out.err"
+    fi
+  done
+  ((${#AVAILABLE_SCHEMES[@]})) || fatal 'Matugen could not generate a preview for any supported scheme'
+  PREVIEW_DIR="$dir"
+}
+
+choose_scheme(){
+  if [[ -n "$SCHEME" ]]; then SCHEME="$(normalize_scheme "$SCHEME")"; return; fi
+  if ((NONINTERACTIVE)); then SCHEME=scheme-tonal-spot; return; fi
+  [[ -n "$WALLPAPER" ]] || choose_wallpaper
+  need matugen
+  build_previews
+  printf '\nSchemes for %s mode\n\n' "$MODE"
+  printf '  %-3s %-13s %-16s %-16s %-16s\n' '#' 'Scheme' 'Primary' 'Secondary' 'Tertiary'
+  local i=0 scheme p s t
+  for scheme in "${AVAILABLE_SCHEMES[@]}"; do
+    ((i+=1))
+    p="$(json_color "$PREVIEW_DIR/$scheme.json" primary "$MODE" 2>/dev/null || true)"
+    s="$(json_color "$PREVIEW_DIR/$scheme.json" secondary "$MODE" 2>/dev/null || true)"
+    t="$(json_color "$PREVIEW_DIR/$scheme.json" tertiary "$MODE" 2>/dev/null || true)"
+    printf '  %-3d %-13s ' "$i" "$(scheme_label "$scheme")"
+    swatch "${p:-#555555}"; printf '  '
+    swatch "${s:-#555555}"; printf '  '
+    swatch "${t:-#555555}"; printf '\n'
+  done
+  printf '\nChoose scheme [1]: '
+  local n=''; read -r n || true
+  n="${n:-1}"
+  [[ "$n" =~ ^[0-9]+$ ]] || fatal 'invalid scheme selection'
+  ((n>=1 && n<=${#AVAILABLE_SCHEMES[@]})) || fatal 'scheme selection out of range'
+  SCHEME="${AVAILABLE_SCHEMES[$((n-1))]}"
+}
+
+choose_mode(){
+  printf '\nMode  1 Dark  2 Light\n> '
+  local x; read -r x; x="$(trim "$x")"
+  case "$x" in 1) MODE=dark;;2) MODE=light;;*) fatal 'invalid mode' ;; esac
+}
+
+make_palette(){
+  local out="$CURRENT_DIR/palette.json" tmp matugen_cfg
+  mkdir -p "$CURRENT_DIR"
+  tmp="$(mktemp "$CURRENT_DIR/.palette.XXXXXX")"
+  matugen_cfg="$(mktemp "$CURRENT_DIR/.matugen-config.XXXXXX.toml")"
+  cp -- "$THEMY_CONFIG_DIR/internals/matugen-config.toml" "$matugen_cfg"
+  local -a args=(image "$WALLPAPER" -m "$MODE" -t "$SCHEME" --json hex)
+  if [[ "$COLOR" =~ ^[0-9]+$ ]]; then args+=(--source-color-index "$((COLOR-1))")
+  elif [[ "$COLOR" == auto ]]; then args+=(--source-color-index 0)
+  else
+    args=(color hex "$COLOR" -m "$MODE" -t "$SCHEME" --json hex)
+  fi
+  [[ -n "$CONTRAST" ]] && args+=(--contrast "$CONTRAST")
+  if ! matugen -c "$matugen_cfg" "${args[@]}" > "$tmp"; then
+    rm -f -- "$tmp" "$matugen_cfg"
+    fatal 'Matugen palette generation failed; the user Matugen template configuration was not used'
+  fi
+  rm -f -- "$matugen_cfg"
+  if ! python3 - "$tmp" <<'PY2'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p,encoding='utf-8'))
+def find(x):
+ if isinstance(x,dict):
+  if all(k in x for k in ('primary','secondary','tertiary','surface')): return x
+  for v in x.values():
+   r=find(v)
+   if r:return r
+ elif isinstance(x,list):
+  for v in x:
+   r=find(v)
+   if r:return r
+if not find(d):
+    raise SystemExit('Matugen JSON did not contain a Material palette')
+PY2
+  then
+    rm -f -- "$tmp"
+    fatal 'Matugen returned JSON without a valid Material palette; previous palette was left untouched'
+  fi
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$out"
+}
+
+render_template(){
+  local src="$1" dst="$2" palette="$3"
+  python3 "$THEMY_CONFIG_DIR/internals/render-template.py" "$src" "$dst" "$palette"
+}
+
+run_hook(){
+  local hook="$1" dir="$2" name="$3"
+  local stage="${4:-}" palette="${5:-}" mode="${6:-}" scheme="${7:-}" wallpaper="${8:-}" backup="${9:-}"
+  local -a cmd=(env
+    -u THEMY_STAGE_DIR -u THEMY_PALETTE -u THEMY_MODE -u THEMY_SCHEME -u THEMY_WALLPAPER -u THEMY_BACKUP_DIR
+    "THEMY_ROOT=$ROOT_DIR"
+    "THEMY_MODULE_DIR=$dir"
+    "THEMY_CONFIG_DIR=$THEMY_CONFIG_DIR"
+    "THEMY_DATA_DIR=$THEMY_DATA_DIR"
+    "THEMY_STATE_DIR=$THEMY_STATE_DIR"
+    "THEMY_XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+    "THEMY_XDG_DATA_HOME=$XDG_DATA_HOME"
+    "THEMY_XDG_STATE_HOME=$XDG_STATE_HOME"
+  )
+
+  case "$hook" in
+    render|apply)
+      cmd+=("THEMY_MODULE_NAME=$name" "THEMY_STAGE_DIR=$stage" "THEMY_PALETTE=$palette" "THEMY_MODE=$mode" "THEMY_SCHEME=$scheme" "THEMY_WALLPAPER=$wallpaper")
+      ;;
+    backup|restore)
+      cmd+=("THEMY_MODULE_NAME=$name" "THEMY_BACKUP_DIR=$backup")
+      ;;
+    doctor)
+      cmd+=("THEMY_MODULE_NAME=$name")
+      ;;
+    *) fatal "internal error: unknown module hook: $hook" ;;
+  esac
+  cmd+=("$dir/$hook")
+  "${cmd[@]}"
+}
+
+run_modules(){
+  local stage="$1" name dir
+  local ok_list="$stage/.module-list-ok"
+  : > "$ok_list"
+  RENDER_FAILED_MODULES=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    dir="$TEMPLATES_DIR/$name"
+    mkdir -p "$stage/$name"
+    log "  rendering $name"
+    if run_hook render "$dir" "$name" "$stage/$name" "$CURRENT_DIR/palette.json" "$MODE" "$SCHEME" "$WALLPAPER"; then
+      printf '%s\n' "$name" >> "$ok_list"
+    else
+      warn "module '$name' render failed; it will be skipped this run"
+      RENDER_FAILED_MODULES+=("$name")
+    fi
+  done < <(discover_modules)
+}
+
+prepare_backup(){
+  local stage="$1" name dir
+  local backup="$stage/backup"
+  rm -rf -- "$backup"
+  mkdir -p "$backup"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    dir="$TEMPLATES_DIR/$name"
+    if [[ -x "$dir/backup" ]]; then
+      mkdir -p "$backup/$name"
+      log "  backing up $name"
+      if ! run_hook backup "$dir" "$name" "" "" "" "" "" "$backup/$name"; then
+        warn "module '$name' backup failed; rollback may be incomplete"
+        return 1
+      fi
+    else
+      log "  note: $name has no backup script"
+    fi
+  done < "$stage/.module-list-ok"
+}
+
+apply_modules(){
+  local stage="$1" name dir
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    dir="$TEMPLATES_DIR/$name"
+    log "  applying $name"
+    if ! run_hook apply "$dir" "$name" "$stage/$name" "$CURRENT_DIR/palette.json" "$MODE" "$SCHEME" "$WALLPAPER"; then
+      warn "module '$name' apply failed"
+      return 1
+    fi
+  done < "$stage/.module-list-ok"
+}
+
+restore_modules(){
+  local backup="$1" entry name dir
+  [[ -d "$backup" ]] || fatal "backup not found: $backup"
+  for entry in "$backup"/*; do
+    [[ -d "$entry" ]] || continue
+    name="$(basename "$entry")"
+    dir="$TEMPLATES_DIR/$name"
+    [[ -x "$dir/restore" ]] || continue
+    log "  restoring $name"
+    run_hook restore "$dir" "$name" "" "" "" "" "" "$backup/$name"
+  done
+}
+
+validate_stage(){
+  local stage="$1" name dir
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    dir="$TEMPLATES_DIR/$name"
+    [[ -s "$stage/$name/.module-ok" ]] || fatal "module '$name' did not validate its staged output"
+  done < "$stage/.module-list-ok"
+}
+
+cleanup_stage(){
+  if [[ -n "$STAGE_CLEANUP" ]]; then
+    rm -rf -- "$STAGE_CLEANUP"
+    STAGE_CLEANUP=""
+  fi
+}
+
+generate(){
+  need matugen; need python3; need awk; need mktemp
+  mkdir -p "$THEMY_STATE_DIR"
+  local stage; stage="$(mktemp -d "$THEMY_STATE_DIR/staging.XXXXXX")"
+  STAGE_CLEANUP="$stage"
+  trap cleanup_stage EXIT
+  make_palette
+  run_modules "$stage"
+  validate_stage "$stage"
+  if ((NO_APPLY)); then
+    log 'Generation validated; nothing applied.'
+  else
+    prepare_backup "$stage"
+    if ! apply_modules "$stage"; then
+      warn 'apply failed; restoring the pre-apply configuration'
+      restore_modules "$stage/backup" || warn 'automatic rollback was incomplete'
+      exit 1
+    fi
+    rm -rf -- "$BACKUP_DIR"
+    cp -a -- "$stage/backup" "$BACKUP_DIR"
+    save_state
+    if ((${#RENDER_FAILED_MODULES[@]})); then
+      warn "applied with ${#RENDER_FAILED_MODULES[@]} module(s) skipped: ${RENDER_FAILED_MODULES[*]}"
+    fi
+    log 'Theme applied.'
+  fi
+  cleanup_stage
+  trap - EXIT
+}
+
+restore_backup(){
+  [[ -d "$BACKUP_DIR" ]] || fatal 'no previous theme backup is available'
+  restore_modules "$BACKUP_DIR"
+  log 'Previous theme restored.'
+}
+
+paths(){
+  printf 'themy %s paths\n\n' "$VERSION"
+  printf 'Root:                 %s\n' "$ROOT_DIR"
+  printf 'XDG_CONFIG_HOME:      %s\n' "$XDG_CONFIG_HOME"
+  printf 'XDG_DATA_HOME:        %s\n' "$XDG_DATA_HOME"
+  printf 'XDG_STATE_HOME:       %s\n' "$XDG_STATE_HOME"
+  printf 'XDG_CACHE_HOME:       %s\n' "$XDG_CACHE_HOME"
+  printf 'THEMY_CONFIG_DIR:     %s\n' "$THEMY_CONFIG_DIR"
+  printf 'THEMY_DATA_DIR:       %s\n' "$THEMY_DATA_DIR"
+  printf 'THEMY_STATE_DIR:      %s\n' "$THEMY_STATE_DIR"
+  printf 'THEMY_MODULES_DIR:    %s\n' "$MODULES_DIR"
+  load_wallpaper_dir
+  if [[ -n "$WALLPAPER_DIR" ]]; then
+    printf 'Wallpaper folder:     %s\n' "$WALLPAPER_DIR"
+  else
+    printf 'Wallpaper folder:     (not selected)\n'
+  fi
+  if [[ -n "${YAZI_CONFIG_HOME:-}" ]]; then
+    printf 'YAZI_CONFIG_HOME:      %s\n' "$YAZI_CONFIG_HOME"
+  else
+    printf 'YAZI_CONFIG_HOME:      %s (default)\n' "$XDG_CONFIG_HOME/yazi"
+  fi
+}
+
+status(){
+  printf 'themy %s\n\n' "$VERSION"
+  printf 'Config:    %s\n' "$THEMY_CONFIG_DIR"
+  printf 'Modules:   %s\n' "$TEMPLATES_DIR"
+  printf 'State:     %s\n' "$STATE_FILE"
+  [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || printf 'No successful theme run yet.\n'
+  printf '\n'; modules
+}
+
+doctor(){
+  local rc=0 name dir
+  printf 'themy doctor\n\n'
+  for c in matugen python3 awk git; do
+    if command -v "$c" >/dev/null 2>&1; then printf '  OK   %-14s %s\n' "$c" "$(command -v "$c")"; else printf '  FAIL %-14s missing\n' "$c"; rc=1; fi
+  done
+  printf '\nGUI\n'
+  if python3 -c 'import PyQt6' >/dev/null 2>&1; then
+    printf '  OK   %-14s PyQt6 available\n' GUI
+  else
+    printf '  INFO %-14s PyQt6 not installed; CLI remains usable\n' GUI
+  fi
+  printf '\nModules\n'
+  load_module_state
+  for dir in "$TEMPLATES_DIR"/*; do
+    [[ -d "$dir" ]] || continue; [[ -f "$dir/module.conf" ]] || continue
+    name="$(basename "$dir")"
+    if [[ ! -x "$dir/render" || ! -x "$dir/apply" ]]; then printf '  FAIL %-14s incomplete module\n' "$name"; rc=1; continue; fi
+    if [[ -x "$dir/doctor" ]]; then
+      if run_hook doctor "$dir" "$name"; then :; else rc=1; fi
+    else printf '  OK   %-14s contract present\n' "$name"; fi
+  done
+  return "$rc"
+}
+
+parse(){
+  while (($#)); do
+    case "$1" in
+      status|doctor|modules|gui|restore-backup|paths|current-wallpaper) COMMAND="$1"; shift;;
+      -i|--interactive) COMMAND=apply; NONINTERACTIVE=0; shift;;
+      module)
+        shift
+        MODULE_SUB="${1:-}"
+        case "$MODULE_SUB" in
+          list)
+            shift; (($# == 0)) || fatal 'module list does not accept arguments'
+            COMMAND=module_list
+            ;;
+          install)
+            shift
+            [[ $# -ge 1 ]] || fatal 'usage: themy module install GIT-URL [NAME]'
+            MODULE_URL="$1"; MODULE_NAME="${2:-}"
+            shift; [[ $# -ge 1 ]] && shift
+            (($# == 0)) || fatal 'module install accepts at most GIT-URL and NAME'
+            COMMAND=module
+            ;;
+          delete|remove)
+            shift
+            [[ $# -ge 1 ]] || fatal 'usage: themy module delete NAME'
+            MODULE_NAME="$1"; shift
+            (($# == 0)) || fatal 'module delete does not accept extra arguments'
+            COMMAND=module
+            ;;
+          *)
+            [[ $# -ge 2 ]] || fatal 'usage: themy module NAME on|off | module list | module install GIT-URL | module delete NAME'
+            MODULE_NAME="$1"; MODULE_ACTION="$2"; shift 2
+            (($# == 0)) || fatal 'module command does not accept extra arguments'
+            COMMAND=module
+            ;;
+        esac
+        ;;
+      --dark) COMMAND=apply; MODE=dark; shift;; --light) COMMAND=apply; MODE=light; shift;;
+      --scheme) COMMAND=apply; [[ $# -ge 2 ]] || fatal '--scheme needs a value'; SCHEME="$2"; shift 2;;
+      --color) COMMAND=apply; [[ $# -ge 2 ]] || fatal '--color needs a value'; COLOR="$2"; shift 2;;
+      --contrast) COMMAND=apply; [[ $# -ge 2 ]] || fatal '--contrast needs a value'; CONTRAST="$2"; shift 2;;
+      --non-interactive) COMMAND=apply; NONINTERACTIVE=1; shift;; --quiet) QUIET=1; shift;; --no-apply) COMMAND=apply; NO_APPLY=1; shift;;
+      -h|--help) usage; exit 0;; --version) printf '%s\n' "$VERSION"; exit 0;;
+      -*) fatal "unknown option: $1";;
+      *) COMMAND=apply; [[ -z "$WALLPAPER" ]] || fatal 'only one image may be supplied'; WALLPAPER="$1"; shift;;
+    esac
+  done
+}
+
+main(){
+  parse "$@"
+  trap 'cleanup_stage 2>/dev/null || true' EXIT INT TERM
+  ensure_layout
+  case "$COMMAND" in
+    status) status;; doctor) doctor;; modules) modules;;
+    current-wallpaper) print_current_wallpaper;;
+    module_list) modules;;
+    paths) paths;;
+    restore-backup) restore_backup;;
+    gui)
+      load_module_state
+      python3 -c 'import PyQt6' >/dev/null 2>&1 || fatal 'PyQt6 is required for the GUI; install your distro Qt6/PyQt6 package'
+      exec python3 "$THEMY_CONFIG_DIR/gui/themy-gui.py"
+      ;;
+    module)
+      case "$MODULE_SUB" in
+        install) module_install "$MODULE_URL" "$MODULE_NAME";;
+        delete|remove) module_delete "$MODULE_NAME";;
+        *)
+          [[ -n "$MODULE_NAME" && "$MODULE_ACTION" =~ ^(on|off)$ ]] || fatal 'usage: themy module NAME on|off'
+          [[ -f "$TEMPLATES_DIR/$MODULE_NAME/module.conf" ]] || fatal "unknown module: $MODULE_NAME"
+          set_module_state "$MODULE_NAME" "$MODULE_ACTION"; printf '%s: %s\n' "$MODULE_NAME" "$MODULE_ACTION"
+          ;;
+      esac;;
+    apply) resolve_inputs; generate;;
+  esac
+  notify-send "Theme applied for ${WALLPAPER##*/}" 
+}
+main "$@"
