@@ -1,3 +1,4 @@
+                        ﷽
 # themy
 
 **themy** is a modular, wallpaper-driven desktop theming tool for Linux.
