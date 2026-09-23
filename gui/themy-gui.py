@@ -29,12 +29,18 @@ from PyQt6.QtWidgets import (
 INTERNALS_DIR = Path(__file__).resolve().parents[1] / "internals"
 if str(INTERNALS_DIR) not in sys.path:
     sys.path.insert(0, str(INTERNALS_DIR))
-from module_install import (
-    ModuleInstallError,
-    install_module,
-    module_name_from_repo,
-    read_module_metadata,
-)
+def read_template_metadata(path: Path) -> dict:
+    meta = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            meta[key.strip()] = value.strip().strip("\"'")
+    except OSError:
+        pass
+    return meta
 from color_utils import hex_color
 
 
@@ -75,7 +81,7 @@ XDG_CONFIG_HOME = env_path("XDG_CONFIG_HOME", Path.home() / ".config")
 XDG_DATA_HOME = env_path("XDG_DATA_HOME", Path.home() / ".local" / "share")
 XDG_STATE_HOME = env_path("XDG_STATE_HOME", Path.home() / ".local" / "state")
 THEMY_CONFIG_DIR = XDG_CONFIG_HOME / "themy"
-MODULES_DIR = env_path("THEMY_MODULES_DIR", THEMY_CONFIG_DIR / "modules")
+TEMPLATES_DIR = THEMY_CONFIG_DIR / "templates"
 CACHE_DIR = THEMY_CONFIG_DIR / "cache" / "palettes"
 GUI_STATE = THEMY_CONFIG_DIR / "gui.json"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".avif"}
@@ -168,17 +174,19 @@ class SchemeCard(QFrame):
         super().mousePressEvent(event)
 
 class ProgramCatalogDialog(QDialog):
-    """Browser dialog to fetch and install new module templates from a Git repository."""
+    """Browser dialog to fetch and install new template collection from a Git repository."""
 
     def __init__(self, parent=None, colors=None):
         super().__init__(parent)
-        self.setWindowTitle("Get Programs & Templates")
+        self.setWindowTitle("Add Programs")
         self.setMinimumSize(640, 520)
         self.repo_file = THEMY_CONFIG_DIR / "repo_url.txt"
         self.colors = colors or DEFAULTS
         self.setStyleSheet(self.stylesheet())
-        self.catalog_modules = []
+        self.catalog_templates = []
         self.init_ui()
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(50, self.fetch_repo)
 
     def stylesheet(self):
         c = self.colors
@@ -233,7 +241,7 @@ class ProgramCatalogDialog(QDialog):
         layout.addWidget(self.scroll, 1)
 
         footer = QHBoxLayout()
-        self.status_lbl = QLabel("Enter a repository URL and click Fetch.")
+        self.status_lbl = QLabel("Fetching templates…")
         self.status_lbl.setObjectName("muted")
         footer.addWidget(self.status_lbl, 1)
 
@@ -243,9 +251,9 @@ class ProgramCatalogDialog(QDialog):
         layout.addLayout(footer)
 
     def get_ignore_list(self) -> set:
-        """Default ignored folders plus any names listed in ~/.config/themy/ignore_modules.txt"""
+        """Default ignored folders plus any names listed in ~/.config/themy/ignore_templates.txt"""
         ignore = {".git", ".github", "docs", ".cache", "__pycache__"}
-        ignore_file = THEMY_CONFIG_DIR / "ignore_modules.txt"
+        ignore_file = THEMY_CONFIG_DIR / "ignore_templates.txt"
         if ignore_file.is_file():
             try:
                 for line in ignore_file.read_text(encoding="utf-8").splitlines():
@@ -276,7 +284,7 @@ class ProgramCatalogDialog(QDialog):
         self.repo_file.write_text(url, encoding="utf-8")
 
         self.fetch_btn.setEnabled(False)
-        self.status_lbl.setText("Listing repository modules without cloning...")
+        self.status_lbl.setText("Fetching repository templates...")
         QApplication.processEvents()
 
         owner, repo = self.parse_github_owner_repo(url)
@@ -299,36 +307,39 @@ class ProgramCatalogDialog(QDialog):
 
             ignored = self.get_ignore_list()
             dirs = [
-                item["name"]
+                item
                 for item in contents
                 if item.get("type") == "dir"
                 and item["name"] not in ignored
                 and not item["name"].startswith(".")
             ]
 
-            self.catalog_modules = []
-            for d in dirs:
+            self.catalog_templates = []
+            for entry in dirs:
+                d = entry["name"]
                 meta = self.fetch_remote_conf(owner, repo, d)
-                self.catalog_modules.append({
+                self.catalog_templates.append({
                     "id": d,
-                    "name": meta.get("name", d),
-                    "description": meta.get("description", "Community template module"),
+                    "name": meta.get("name", d.replace("_", " ").replace("-", " ").title()),
+                    "description": meta.get("description", "Themy template"),
                     "version": meta.get("version", ""),
                     "owner": owner,
                     "repo": repo,
+                    "source_sha": entry.get("sha", ""),
                     "is_remote_archive": True,
                 })
 
             self.populate_items()
-            available_count = sum(1 for m in self.catalog_modules if not (MODULES_DIR / m["id"]).exists())
-            self.status_lbl.setText(f"Found {len(self.catalog_modules)} total; {available_count} new to install.")
+            new_count = sum(1 for m in self.catalog_templates if not (TEMPLATES_DIR / m["id"]).exists())
+            update_count = sum(1 for m in self.catalog_templates if self.template_needs_update(m))
+            self.status_lbl.setText(f"Found {len(self.catalog_templates)} templates; {new_count} new, {update_count} update{'s' if update_count != 1 else ''}.")
         except Exception as exc:
             self.status_lbl.setText(f"GitHub API error: {exc}")
 
     def fetch_remote_conf(self, owner, repo, directory):
         import urllib.request
 
-        conf_url = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{directory}/module.conf"
+        conf_url = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{directory}/template.conf"
         req = urllib.request.Request(conf_url, headers={"User-Agent": "Themy-App"})
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -359,25 +370,46 @@ class ProgramCatalogDialog(QDialog):
                 return
 
             ignored = self.get_ignore_list()
-            self.catalog_modules = []
+            self.catalog_templates = []
             for entry in sorted(cache_dir.iterdir(), key=lambda p: p.name.lower()):
                 if not entry.is_dir() or entry.name in ignored or entry.name.startswith("."):
                     continue
-                conf = entry / "module.conf"
-                meta = read_module_metadata(conf) if conf.is_file() else {}
-                self.catalog_modules.append({
+                conf = entry / "template.conf"
+                meta = read_template_metadata(conf) if conf.is_file() else {}
+                self.catalog_templates.append({
                     "id": entry.name,
-                    "name": meta.get("name", entry.name),
-                    "description": meta.get("description", "Community template module"),
+                    "name": meta.get("name", entry.name.replace("_", " ").replace("-", " ").title()),
+                    "description": meta.get("description", "Themy template"),
                     "version": meta.get("version", ""),
                     "path": entry,
+                    "source_sha": "",
                     "is_remote_archive": False,
                 })
             self.populate_items()
-            available_count = sum(1 for m in self.catalog_modules if not (MODULES_DIR / m["id"]).exists())
-            self.status_lbl.setText(f"Found {len(self.catalog_modules)} total; {available_count} new to install.")
+            new_count = sum(1 for m in self.catalog_templates if not (TEMPLATES_DIR / m["id"]).exists())
+            self.status_lbl.setText(f"Found {len(self.catalog_templates)} templates; {new_count} new.")
         except Exception as exc:
             self.status_lbl.setText(f"Error: {exc}")
+
+    def installed_source(self, template_id):
+        path = TEMPLATES_DIR / template_id / ".themy-source.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def template_needs_update(self, item):
+        target = TEMPLATES_DIR / str(item.get("id", ""))
+        if not target.is_dir():
+            return False
+        remote_sha = str(item.get("source_sha", ""))
+        if not remote_sha:
+            return False
+        local = self.installed_source(item["id"])
+        return bool(local.get("sha") and local.get("sha") != remote_sha)
+
+    def installed_template(self, template_id):
+        return (TEMPLATES_DIR / template_id).is_dir()
 
     def populate_items(self):
         while self.cards_layout.count() > 1:
@@ -385,25 +417,13 @@ class ProgramCatalogDialog(QDialog):
             if child.widget():
                 child.widget().deleteLater()
 
-        # Do not show already installed templates in the download page
-        uninstalled = [
-            item for item in self.catalog_modules
-            if not (MODULES_DIR / item["id"]).exists()
-        ]
-
-        if not self.catalog_modules:
-            lbl = QLabel("No modules found in this repository.")
+        if not self.catalog_templates:
+            lbl = QLabel("No templates found in this repository.")
             lbl.setObjectName("muted")
             self.cards_layout.insertWidget(0, lbl)
             return
 
-        if not uninstalled:
-            lbl = QLabel("All templates from this repository are already installed.")
-            lbl.setObjectName("selectedTag")
-            self.cards_layout.insertWidget(0, lbl)
-            return
-
-        for item in uninstalled:
+        for item in self.catalog_templates:
             card = QFrame()
             card.setObjectName("programRow")
             c_lay = QHBoxLayout(card)
@@ -421,29 +441,36 @@ class ProgramCatalogDialog(QDialog):
             info.addWidget(subtitle)
             c_lay.addLayout(info, 1)
 
-            btn = QPushButton("Download")
+            installed = self.installed_template(item["id"])
+            updating = installed and self.template_needs_update(item)
+            btn = QPushButton("Update" if updating else ("Installed" if installed else "Download"))
+            btn.setEnabled(not installed or updating)
             btn.clicked.connect(lambda _, it=item, c=card, b=btn: self.install_item(it, c, b))
             c_lay.addWidget(btn)
 
             self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
 
+    def closeEvent(self, event):
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "load_templates"):
+            parent.load_templates()
+        super().closeEvent(event)
+
     def install_item(self, item, card_widget, btn):
-        mod_id = str(item.get("id", ""))
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", mod_id):
-            self.status_lbl.setText("Install refused: invalid module name.")
+        template_id = str(item.get("id", ""))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", template_id):
+            self.status_lbl.setText("Install refused: invalid template name.")
             return
-        target = MODULES_DIR / mod_id
+        target = TEMPLATES_DIR / template_id
         if target.is_symlink():
-            self.status_lbl.setText("Install refused: module path is a symbolic link.")
+            self.status_lbl.setText("Install refused: template path is a symbolic link.")
             return
         try:
             btn.setEnabled(False)
             self.status_lbl.setText(f"Downloading {item['name']}...")
             QApplication.processEvents()
 
-            MODULES_DIR.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                shutil.rmtree(target)
+            TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
             if item.get("is_remote_archive"):
                 import urllib.request
@@ -453,51 +480,123 @@ class ProgramCatalogDialog(QDialog):
                 tar_url = f"https://api.github.com/repos/{item['owner']}/{item['repo']}/tarball/HEAD"
                 req = urllib.request.Request(tar_url, headers={"User-Agent": "Themy-App"})
 
-                target.mkdir(parents=True, exist_ok=True)
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    with tarfile.open(fileobj=io.BytesIO(resp.read()), mode="r:gz") as tar:
-                        mod_id = item["id"]
-                        for member in tar.getmembers():
-                            parts = Path(member.name).parts
-                            if len(parts) < 2 or parts[1] != mod_id:
-                                continue
-                            if member.issym() or member.islnk() or member.isdev():
-                                raise RuntimeError(f"unsafe archive member: {member.name}")
-                            rel_path = Path(*parts[2:])
-                            if not rel_path.parts or rel_path.is_absolute() or ".." in rel_path.parts:
-                                raise RuntimeError(f"unsafe archive path: {member.name}")
-                            dest = (target / rel_path).resolve()
-                            if target.resolve() not in dest.parents and dest != target.resolve():
-                                raise RuntimeError(f"archive escapes module directory: {member.name}")
-                            if member.isdir():
-                                dest.mkdir(parents=True, exist_ok=True)
-                            elif member.isfile():
-                                if member.size > 8 * 1024 * 1024:
-                                    raise RuntimeError(f"archive member is too large: {member.name}")
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                extracted = tar.extractfile(member)
-                                if extracted:
+                # Extract into a private staging directory first. GitHub archives
+                # have a synthetic root such as `Impairon-themy_templates-<sha>/`;
+                # the template directory itself is therefore the second path part.
+                # The directory entry for that template is valid and must not be
+                # mistaken for an empty/unsafe relative path.
+                staging = Path(tempfile.mkdtemp(prefix=f".download-{template_id}-", dir=TEMPLATES_DIR))
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        with tarfile.open(fileobj=io.BytesIO(resp.read()), mode="r:gz") as tar:
+                            found_template = False
+                            for member in tar.getmembers():
+                                name = member.name.replace("\\", "/")
+                                parts = Path(name).parts
+                                if not parts or Path(name).is_absolute() or ".." in parts:
+                                    raise RuntimeError(f"unsafe archive path: {member.name}")
+                                if len(parts) < 2 or parts[1] != template_id:
+                                    continue
+
+                                # The archive's own template directory is expected.
+                                if len(parts) == 2:
+                                    if not member.isdir():
+                                        raise RuntimeError(f"unsafe template archive member: {member.name}")
+                                    found_template = True
+                                    continue
+
+                                if member.issym() or member.islnk() or member.isdev():
+                                    raise RuntimeError(f"unsafe archive member: {member.name}")
+
+                                rel_path = Path(*parts[2:])
+                                if rel_path.is_absolute() or not rel_path.parts or ".." in rel_path.parts:
+                                    raise RuntimeError(f"unsafe archive path: {member.name}")
+
+                                dest = (staging / rel_path).resolve()
+                                if staging.resolve() not in dest.parents and dest != staging.resolve():
+                                    raise RuntimeError(f"archive escapes template directory: {member.name}")
+
+                                if member.isdir():
+                                    dest.mkdir(parents=True, exist_ok=True)
+                                elif member.isfile():
+                                    if member.size > 8 * 1024 * 1024:
+                                        raise RuntimeError(f"archive member is too large: {member.name}")
+                                    dest.parent.mkdir(parents=True, exist_ok=True)
+                                    extracted = tar.extractfile(member)
+                                    if extracted is None:
+                                        raise RuntimeError(f"could not read archive member: {member.name}")
                                     data = extracted.read()
                                     if len(data) != member.size:
                                         raise RuntimeError(f"short archive read: {member.name}")
                                     dest.write_bytes(data)
                                     if member.mode & 0o111:
                                         dest.chmod(dest.stat().st_mode | 0o755)
+
+                            if not found_template:
+                                raise RuntimeError(f"template directory not found in archive: {template_id}")
+
+                    # Only replace the installed template after the complete archive
+                    # has been validated and extracted successfully.
+                    if target.exists():
+                        shutil.rmtree(target)
+                    staging.rename(target)
+                    staging = None
+                finally:
+                    if staging is not None:
+                        shutil.rmtree(staging, ignore_errors=True)
             else:
-                shutil.copytree(item["path"], target)
+                staging = Path(tempfile.mkdtemp(prefix=f".download-{template_id}-", dir=TEMPLATES_DIR))
+                try:
+                    shutil.copytree(item["path"], staging, dirs_exist_ok=True)
+                    if target.exists():
+                        shutil.rmtree(target)
+                    staging.rename(target)
+                    staging = None
+                finally:
+                    if staging is not None:
+                        shutil.rmtree(staging, ignore_errors=True)
 
             for hook in ("render", "apply", "doctor", "backup", "restore"):
                 hook_file = target / hook
                 if hook_file.is_file():
                     hook_file.chmod(hook_file.stat().st_mode | 0o755)
 
-            # Auto-enable newly installed module in modules.json
+            # Every downloaded directory is a template. Metadata is optional in the
+            # repository, so create a local template.conf when the repository does not
+            # provide one. This keeps the on-disk template contract self-describing.
             try:
-                state_file = THEMY_CONFIG_DIR / "modules.json"
+                conf = target / "template.conf"
+                if not conf.is_file():
+                    conf.write_text(
+                        "# Generated by Themy\n"
+                        f"id={template_id}\n"
+                        f"name={item.get('name', template_id)}\n"
+                        f"version={item.get('version', '')}\n"
+                        f"description={item.get('description', 'Themy template')}\n",
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
+
+            # Record where this template came from so future fetches can detect updates.
+            try:
+                source = {
+                    "repository": f"https://github.com/{item.get('owner', '')}/{item.get('repo', '')}" if item.get("owner") else str(self.repo_input.text().strip()),
+                    "id": template_id,
+                    "sha": str(item.get("source_sha", "")),
+                    "version": str(item.get("version", "")),
+                }
+                (target / ".themy-source.json").write_text(json.dumps(source, indent=2) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+            # Auto-enable newly installed template in templates.json
+            try:
+                state_file = THEMY_CONFIG_DIR / "templates.json"
                 states = {}
                 if state_file.is_file():
                     states = json.loads(state_file.read_text(encoding="utf-8"))
-                states[mod_id] = True
+                states[template_id] = True
                 tmp_state = state_file.with_suffix(".json.tmp")
                 tmp_state.write_text(json.dumps(states, indent=2) + "\n", encoding="utf-8")
                 tmp_state.chmod(0o600)
@@ -507,6 +606,8 @@ class ProgramCatalogDialog(QDialog):
 
             self.status_lbl.setText(f"Installed {item['name']} successfully.")
             self.populate_items()
+            if self.parent() is not None and hasattr(self.parent(), "load_templates"):
+                self.parent().load_templates()
         except Exception as exc:
             btn.setEnabled(True)
             self.status_lbl.setText(f"Install failed: {exc}")
@@ -534,13 +635,20 @@ class ThemyWindow(QMainWindow):
         self.busy = False
         self._thumb_cache: dict[str, QIcon] = {}
         THEMY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        MODULES_DIR.mkdir(parents=True, exist_ok=True)
-        self.bootstrap_runtime()
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         self.load_state()
-        self.setWindowTitle("Themy 3.3.6")
+        self.setWindowTitle("Themy 3.3.8")
         self.resize(1400, 900); self.setMinimumSize(1050, 700)
         self.build_ui(); self.apply_palette(DEFAULTS, animate=False)
         self.scan_folder()
+
+    def closeEvent(self, event):
+        # Keep the on-disk template inventory/state current when the GUI closes.
+        try:
+            self.load_templates()
+            self.save_state()
+        finally:
+            super().closeEvent(event)
 
     # ---------- state ----------
     def load_state(self):
@@ -596,18 +704,18 @@ class ThemyWindow(QMainWindow):
         self.pool.start(w)
 
     # ----------------- delete logic ----------------------
-    def delete_module(self, item: dict):
+    def delete_template(self, item: dict):
         if self.busy:
             return
-        mod_id = item["id"]
-        mod_name = item["name"]
+        template_id = item["id"]
+        template_name = item["name"]
         target = Path(item["path"])
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Delete program")
-        box.setText(f"Delete '{mod_name}' module?")
-        box.setInformativeText(f"This will remove the module folder from:\n{target}\n\nAre you sure?")
+        box.setWindowTitle("Delete template")
+        box.setText(f"Delete '{template_name}' template?")
+        box.setInformativeText(f"This will remove the template folder from:\n{target}\n\nAre you sure?")
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         box.setDefaultButton(QMessageBox.StandardButton.No)
         box.setStyleSheet(self.dialog_stylesheet())
@@ -619,21 +727,21 @@ class ThemyWindow(QMainWindow):
             if target.exists():
                 shutil.rmtree(target)
 
-            # Clean from modules.json if tracked
-            state_file = THEMY_CONFIG_DIR / "modules.json"
+            # Clean from templates.json if tracked
+            state_file = THEMY_CONFIG_DIR / "templates.json"
             if state_file.is_file():
                 try:
                     states = json.loads(state_file.read_text(encoding="utf-8"))
-                    if mod_id in states:
-                        del states[mod_id]
+                    if template_id in states:
+                        del states[template_id]
                         state_file.write_text(json.dumps(states, indent=2), encoding="utf-8")
                 except Exception:
                     pass
 
-            self.status.setText(f"Deleted module '{mod_name}'.")
-            self.load_programs()
+            self.status.setText(f"Deleted template '{template_name}'.")
+            self.load_templates()
         except Exception as exc:
-            self.show_message(QMessageBox.Icon.Critical, "Delete failed", f"Could not delete module:\n{exc}")
+            self.show_message(QMessageBox.Icon.Critical, "Delete failed", f"Could not delete template:\n{exc}")
 
     def restore_done(self, ok, result):
         self.busy = False
@@ -673,7 +781,7 @@ class ThemyWindow(QMainWindow):
         self.pages.addWidget(self.build_themes_page())
         self.pages.addWidget(self.build_programs_page())
         self.switch_page(0)
-        self.load_programs()
+        self.load_templates()
 
     def build_themes_page(self):
         page = QWidget(); outer = QVBoxLayout(page); outer.setContentsMargins(0,0,0,0); outer.setSpacing(12)
@@ -712,9 +820,9 @@ class ThemyWindow(QMainWindow):
         page = QWidget(); outer = QVBoxLayout(page); outer.setContentsMargins(0,0,0,0); outer.setSpacing(12)
         head = QHBoxLayout()
         title = QLabel("Programs"); title.setObjectName("sectionTitle")
-        hint = QLabel(f"Modules: {MODULES_DIR}"); hint.setObjectName("muted")
+        hint = QLabel(f"Templates: {TEMPLATES_DIR}"); hint.setObjectName("muted")
         head.addWidget(title); head.addWidget(hint); head.addStretch()
-        self.add_program_btn = QPushButton("＋ Add program"); self.add_program_btn.setToolTip("Clone a Themy module repository into the modules directory."); self.add_program_btn.clicked.connect(self.add_program); head.addWidget(self.add_program_btn)
+        self.add_template_btn = QPushButton("＋ Add program"); self.add_template_btn.setToolTip("Fetch a Themy template repository into the templates directory."); self.add_template_btn.clicked.connect(self.add_template); head.addWidget(self.add_template_btn)
         outer.addLayout(head)
         self.program_area = QScrollArea(); self.program_area.setWidgetResizable(True); self.program_area.setObjectName("programScroll")
         self.program_container = QWidget(); self.program_container.setObjectName("programContainer")
@@ -725,23 +833,20 @@ class ThemyWindow(QMainWindow):
     def switch_page(self, index):
         self.pages.setCurrentIndex(index)
         self.themes_nav.setChecked(index == 0); self.programs_nav.setChecked(index == 1)
-        if index == 1: self.load_programs()
+        if index == 1: self.load_templates()
 
-    def load_programs(self):
+    def load_templates(self):
         if not hasattr(self, "program_layout"):
             return
         try:
-            MODULES_DIR.mkdir(parents=True, exist_ok=True)
-            modules = []
-            for d in sorted(MODULES_DIR.iterdir(), key=lambda p: p.name.lower()):
-                conf = d / "module.conf"
-                if not d.is_dir() or not conf.is_file():
+            TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+            templates = []
+            for d in sorted(TEMPLATES_DIR.iterdir(), key=lambda p: p.name.lower()):
+                if not d.is_dir():
                     continue
-                try:
-                    meta = read_module_metadata(conf)
-                except ModuleInstallError:
-                    meta = {}
-                modules.append({
+                conf = d / "template.conf"
+                meta = read_template_metadata(conf) if conf.is_file() else {}
+                templates.append({
                     "id": meta.get("id", d.name),
                     "name": meta.get("name", d.name),
                     "version": meta.get("version", ""),
@@ -751,31 +856,21 @@ class ThemyWindow(QMainWindow):
                     "enabled": True,
                 })
 
-            # Themy's canonical module state is modules.json.
-            state_file = THEMY_CONFIG_DIR / "modules.json"
+            # Themy's canonical module state is templates.json.
+            state_file = THEMY_CONFIG_DIR / "templates.json"
             try:
                 states = json.loads(state_file.read_text(encoding="utf-8"))
             except Exception:
                 states = {}
-            for item in modules:
+            for item in templates:
                 item["enabled"] = bool(states.get(Path(item["path"]).name, True))
 
-            self._module_items = modules
-            self.programs_loaded(True, modules)
+            self._template_items = templates
+            self.templates_loaded(True, templates)
         except Exception as exc:
-            self.programs_loaded(False, exc)
+            self.templates_loaded(False, exc)
 
-    def bootstrap_runtime(self):
-        """Ensure bundled runtime modules exist before the GUI scans them."""
-        try:
-            result = self.run_cli(["modules"])
-            if result.returncode != 0:
-                return clean_process_text(result.stderr or result.stdout)
-        except Exception as exc:
-            return clean_process_text(str(exc))
-        return None
-
-    def programs_loaded(self, ok, payload):
+    def templates_loaded(self, ok, payload):
         while self.program_layout.count() > 1:
             item = self.program_layout.takeAt(0)
             widget = item.widget()
@@ -783,19 +878,19 @@ class ThemyWindow(QMainWindow):
                 widget.deleteLater()
 
         if not ok:
-            label = QLabel(f"Could not load programs: {payload}")
+            label = QLabel(f"Could not load templates: {payload}")
             label.setObjectName("muted")
             self.program_layout.insertWidget(0, label)
             return
 
-        modules = payload
-        if not modules:
-            label = QLabel("No modules installed yet. Add a Git repository to extend Themy.")
+        templates = payload
+        if not templates:
+            label = QLabel("No templates installed yet. Add a Git repository to extend Themy.")
             label.setObjectName("muted")
             self.program_layout.insertWidget(0, label)
             return
 
-        for item in modules:
+        for item in templates:
             row = QFrame()
             row.setObjectName("programRow")
             layout = QHBoxLayout(row)
@@ -803,7 +898,7 @@ class ThemyWindow(QMainWindow):
             text = QVBoxLayout()
             title = QLabel(item["name"])
             title.setObjectName("cardTitle")
-            detail = item["description"] or f"Module {item['id']}"
+            detail = item["description"] or f"Template {item['id']}"
             if item["version"]:
                 detail += f" · v{item['version']}"
             subtitle = QLabel(detail)
@@ -820,27 +915,27 @@ class ThemyWindow(QMainWindow):
             check.setProperty("programId", Path(item["path"]).name)
             check.setChecked(item["enabled"] and item["valid"])
             check.setEnabled(item["valid"] and not self.busy)
-            check.toggled.connect(self.program_toggled)
+            check.toggled.connect(self.template_toggled)
             layout.addWidget(check)
 
             # Trash / Delete button
             del_btn = QPushButton("🗑")
             del_btn.setObjectName("deleteProgramBtn")
-            del_btn.setToolTip(f"Delete module {item['name']}")
+            del_btn.setToolTip(f"Delete template {item['name']}")
             del_btn.setEnabled(not self.busy)
-            del_btn.clicked.connect(lambda _, mod=item: self.delete_module(mod))
+            del_btn.clicked.connect(lambda _, tpl=item: self.delete_template(tpl))
             layout.addWidget(del_btn)
 
             self.program_layout.insertWidget(self.program_layout.count() - 1, row)
 
 
-    def program_toggled(self, enabled):
+    def template_toggled(self, enabled):
         check = self.sender()
         name = check.property("programId") if check else None
         if not name or self.busy:
             return
         try:
-            state_file = THEMY_CONFIG_DIR / "modules.json"
+            state_file = THEMY_CONFIG_DIR / "templates.json"
             THEMY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 states = json.loads(state_file.read_text(encoding="utf-8"))
@@ -853,20 +948,20 @@ class ThemyWindow(QMainWindow):
             self.status.setText(f"{name}: control {'enabled' if enabled else 'disabled'}")
         except OSError as exc:
             self.show_message(QMessageBox.Icon.Critical, "Program control failed", str(exc))
-            self.load_programs()
+            self.load_templates()
 
-    def add_program(self):
+    def add_template(self):
         if self.busy:
             return
-        if shutil.which("git") is None:
-            self.show_message(QMessageBox.Icon.Critical, "Add program", "git is required to fetch modules.")
-            return
 
+        # The catalog dialog fetches GitHub repositories through the API, so
+        # opening it must not depend on git being installed. Non-GitHub URLs
+        # are handled by the dialog's clone fallback and report their own error.
         dialog = ProgramCatalogDialog(self, getattr(self, "colors", DEFAULTS))
         dialog.exec()
 
-        # Reload the Programs tab so newly downloaded modules appear immediately
-        self.load_programs()
+        # Reload the Programs tab so newly downloaded templates appear immediately
+        self.load_templates()
 
 
 
@@ -1241,7 +1336,7 @@ class ThemyWindow(QMainWindow):
         env["XDG_CONFIG_HOME"] = str(XDG_CONFIG_HOME)
         env["XDG_DATA_HOME"] = str(XDG_DATA_HOME)
         env["XDG_STATE_HOME"] = str(XDG_STATE_HOME)
-        env["THEMY_MODULES_DIR"] = str(MODULES_DIR)
+        env["THEMY_TEMPLATES_DIR"] = str(TEMPLATES_DIR)
         return subprocess.run([str(self.cli)]+args,text=True,capture_output=True,timeout=180,env=env)
 
     def preview_palettes(self):
